@@ -165,7 +165,16 @@ tr:hover td{background:#faf6f0}
     <div class="chart-card wide"><div class="chart-title">Reportes por Inspector</div><div class="chart-sub">Cantidad de RACS por responsable</div><div class="chart-wrap" style="height:200px"><canvas id="racsInsp" role="img" aria-label="Reportes por inspector"></canvas></div></div>
   </div>
   <div class="sec-title">Pareto — Tipologías Anexo 31</div>
-  <div class="chart-card" style="margin-bottom:20px"><div id="paretoBox"></div></div>
+  <div class="chart-card wide" style="margin-bottom:20px">
+    <div class="chart-title">Diagrama de Pareto — Tipologías Anexo 31</div>
+    <div class="chart-sub">Frecuencia por tipología + % acumulado (regla 80/20)</div>
+    <div class="chart-wrap" style="height:300px"><canvas id="paretoChart" role="img" aria-label="Pareto tipologias"></canvas></div>
+  </div>
+  <div class="chart-card" style="margin-bottom:20px">
+    <div class="chart-title">Detalle de Tipologías</div>
+    <div class="chart-sub">Barras de frecuencia por tipología</div>
+    <div id="paretoBox"></div>
+  </div>
   <div class="sec-title">Detalle de Hallazgos</div>
   <div class="table-wrap"><table><thead><tr><th>#</th><th>Inspector</th><th>Tipo</th><th>Nivel</th><th>Tipología</th><th>Lugar</th><th>Estado</th></tr></thead><tbody id="racsBody"></tbody></table></div>
 </div>
@@ -387,6 +396,37 @@ function renderRacs() {
       <div class="pareto-num">${n}</div>
     </div>`).join('') || '<p style="color:#556;font-size:12px">Sin datos</p>';
 
+  // Pareto combo chart (bars + cumulative line)
+  if(ts.length>0){
+    const paretoLabels = ts.map(([t])=>t.length>22?t.slice(0,22)+'…':t);
+    const paretoVals = ts.map(([,n])=>n);
+    const totalPar = paretoVals.reduce((a,b)=>a+b,0);
+    let acc=0;
+    const paretoAcc = paretoVals.map(v=>{ acc+=v; return Math.round(acc/totalPar*100); });
+    mk('paretoChart',{
+      type:'bar',
+      data:{
+        labels:paretoLabels,
+        datasets:[
+          {type:'bar',label:'Frecuencia',data:paretoVals,backgroundColor:COLORS.map(c=>c+'cc'),borderRadius:6,borderSkipped:false,yAxisID:'y'},
+          {type:'line',label:'% Acumulado',data:paretoAcc,borderColor:'#ef4444',backgroundColor:'rgba(239,68,68,.1)',borderWidth:2.5,pointRadius:4,pointBackgroundColor:'#ef4444',tension:.3,yAxisID:'y2'}
+        ]
+      },
+      options:{
+        responsive:true,maintainAspectRatio:false,
+        plugins:{
+          legend:{display:true,position:'top',labels:{color:'#7a6048',font:{size:11},boxWidth:12}},
+          annotation:{annotations:{line80:{type:'line',yMin:80,yMax:80,yScaleID:'y2',borderColor:'rgba(239,68,68,.5)',borderWidth:1.5,borderDash:[5,5]}}}
+        },
+        scales:{
+          x:{grid:{color:'rgba(0,0,0,.06)'},ticks:{color:'#7a6048',font:{size:10},maxRotation:35}},
+          y:{position:'left',grid:{color:'rgba(0,0,0,.06)'},ticks:{color:'#7a6048',stepSize:1},title:{display:true,text:'Frecuencia',color:'#9a8068',font:{size:10}}},
+          y2:{position:'right',min:0,max:100,grid:{drawOnChartArea:false},ticks:{color:'#ef4444',callback:v=>v+'%'},title:{display:true,text:'% Acumulado',color:'#ef4444',font:{size:10}}}
+        }
+      }
+    });
+  }
+
   document.getElementById('racsBody').innerHTML = d.map(r=>`
     <tr><td>${r.n}</td><td style="white-space:nowrap">${r.insp.split(' ')[0]+' '+r.insp.split(' ')[1]}</td>
     <td><span class="badge ${r.tipo==='ACTO'?'badge-purple':'badge-blue'}">${r.tipo}</span></td>
@@ -599,27 +639,47 @@ function handleFileUpload(inp){
 }
 
 function parseRacs(wb){
-  const ws=wb.Sheets[wb.SheetNames[0]];
-  const rows=XLSX.utils.sheet_to_json(ws,{defval:''});
+  // Find RACS sheet (may have trailing space)
+  const sheetName = wb.SheetNames.find(s=>s.trim().toUpperCase()==='RACS')||wb.SheetNames[0];
+  const ws = wb.Sheets[sheetName];
+  // Use header:1 to get raw arrays, skip row 0 (title), row 1 (headers)
+  const raw = XLSX.utils.sheet_to_json(ws, {header:1, defval:''});
   const nd=[];
-  rows.forEach((r,i)=>{
-    const insp=(r['Nombres y Apellidos']||r['Inspector']||'').toString().trim();
-    if(!insp||insp.length<3)return;
-    nd.push({n:i+1,insp,tipo:(r['Tipo de Reporte']||'').toString().toUpperCase().includes('ACTO')?'ACTO':'CONDICIÓN',nivel:nvl(r['Nivel de Perdida']||r['Nivel']||''),tip:(r['tipología de anexo 31']||r['Tipología']||'').toString().trim()||'Sin tipología',lugar:(r['Descripción del Lugar']||r['Lugar']||'Planta beneficio').toString().trim(),estado:(r['Cumpmiento']||r['Cumplimiento']||'').toString().toUpperCase().includes('CERR')?'CERRADO':'ABIERTO'});
-  });
+  // Find header row (contains 'Nombres y Apellidos')
+  let headerIdx = raw.findIndex(r => r.some(c => c && c.toString().includes('Nombres')));
+  if(headerIdx < 0) headerIdx = 1;
+  for(let i = headerIdx+1; i < raw.length; i++){
+    const r = raw[i];
+    const n = r[0]; // N°
+    const insp = (r[3]||'').toString().trim(); // Nombres y Apellidos
+    if(!insp || insp.length < 3) continue;
+    const clase = (r[11]||'').toString().trim(); // Clase de Evento (ACTO/CONDICIÓN)
+    const nivel = (r[10]||'').toString().trim(); // Nivel de Perdida
+    const tip = (r[13]||'').toString().trim();   // Tipología anexo 31
+    const lugar = (r[15]||r[14]||'').toString().trim(); // Descripción del Lugar
+    const estado = (r[20]||'').toString().toUpperCase().includes('CERR')?'CERRADO':'ABIERTO';
+    if(!nivel && !tip) continue; // skip empty rows
+    nd.push({n, insp, tipo:clase.toUpperCase().includes('ACTO')?'ACTO':'CONDICIÓN', nivel:nvl(nivel), tip:tip||'Sin tipología', lugar:lugar||'Planta beneficio', estado});
+  }
   if(nd.length>0)S.racs=nd;
 }
 function nvl(v){const s=v.toString().toUpperCase();return s.includes('ALTO')?'ALTO':s.includes('MEDIO')?'MEDIO':'BAJO';}
 
 function parseAuditOPT(wb){
-  const sn=wb.SheetNames.find(s=>s.toLowerCase().includes('sem'))||wb.SheetNames[0];
-  const rows=XLSX.utils.sheet_to_json(wb.Sheets[sn],{defval:''});
+  const sn=wb.SheetNames.find(s=>s.toLowerCase().includes('opt')||s.toLowerCase().includes('sem'))||wb.SheetNames[0];
+  const raw=XLSX.utils.sheet_to_json(wb.Sheets[sn],{header:1,defval:''});
+  // Find header row
+  let hi=raw.findIndex(r=>r.some(c=>c&&c.toString().toUpperCase().includes('SUPERVISOR')));
+  if(hi<0)hi=1;
   const nd=[];
-  rows.forEach((r,i)=>{
-    const sup=(r['SUPERVISOR ENCARGADO  DE ']||r['SUPERVISOR ENCARGADO DE']||r['Supervisor']||'').toString().trim();
-    if(!sup||sup.length<3)return;
-    nd.push({n:i+1,sup,prog:+(r['PROGRAMADO']||1),ejec:+(r['EJECUTADO ']||r['EJECUTADO']||0),desv:(r['DESVIACION']||'').toString().slice(0,120),cinm:(r['CAUSA INMEDIATA ']||r['CAUSA INMEDIATA']||'').toString().slice(0,80),cbas:(r['CAUSA BAISCA']||r['CAUSA BASICA']||'').toString().slice(0,80),med:(r['MEDIDA CORRECTIVA ']||r['MEDIDA CORRECTIVA']||'').toString().slice(0,80)});
-  });
+  for(let i=hi+1;i<raw.length;i++){
+    const r=raw[i];
+    // PETS(0), PROG(1), EJEC(2), CUMPL(3), SUPERVISOR(4), DESVIACION(5), CAUSA_INM(6), CAUSA_BAS(7), MEDIDA(8)
+    const pets=(r[0]||'').toString().trim();
+    const sup=(r[4]||'').toString().trim();
+    if(!sup||sup.length<3||!pets)continue;
+    nd.push({n:i,sup,pets,prog:+(r[1])||1,ejec:+(r[2])||0,desv:(r[5]||'').toString().slice(0,120),cinm:(r[6]||'').toString().slice(0,80),cbas:(r[7]||'').toString().slice(0,80),med:(r[8]||'').toString().slice(0,80)});
+  }
   if(nd.length>0)S.aopt=nd;
 }
 
